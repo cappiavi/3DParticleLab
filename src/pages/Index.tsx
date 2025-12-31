@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
-import { Hands, Results } from '@mediapipe/hands';
-import { Camera } from '@mediapipe/camera_utils';
 
 type ShapeType = 'sphere' | 'heart' | 'cube' | 'spiral';
 
@@ -15,6 +13,7 @@ interface ParticleData {
 const ParticleSystem = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -24,8 +23,9 @@ const ParticleSystem = () => {
   const isHandOpenRef = useRef<boolean>(true);
   const handDetectedRef = useRef<boolean>(false);
   const animationFrameRef = useRef<number>(0);
-  const mediapipeHandsRef = useRef<Hands | null>(null);
-  const mediapipeCameraRef = useRef<Camera | null>(null);
+  const handsRef = useRef<any>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processingRef = useRef<boolean>(false);
 
   const [particleCount, setParticleCount] = useState(20000);
   const [forceStrength, setForceStrength] = useState(0.15);
@@ -34,6 +34,7 @@ const ParticleSystem = () => {
   const [cameraActive, setCameraActive] = useState(false);
   const [handStatus, setHandStatus] = useState<'none' | 'open' | 'fist'>('none');
   const [isLoading, setIsLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Generate shape positions
   const generateShapePositions = useCallback((shape: ShapeType, count: number): Float32Array => {
@@ -304,10 +305,9 @@ const ParticleSystem = () => {
 
   // Calculate if hand is open or fist
   const calculateHandGesture = useCallback((landmarks: { x: number; y: number; z: number }[]): boolean => {
-    // Check if fingers are extended by comparing fingertip to palm distance
     const palmBase = landmarks[0];
-    const fingertips = [landmarks[8], landmarks[12], landmarks[16], landmarks[20]]; // index, middle, ring, pinky tips
-    const knuckles = [landmarks[5], landmarks[9], landmarks[13], landmarks[17]]; // MCP joints
+    const fingertips = [landmarks[8], landmarks[12], landmarks[16], landmarks[20]];
+    const knuckles = [landmarks[5], landmarks[9], landmarks[13], landmarks[17]];
     
     let extendedFingers = 0;
     
@@ -321,51 +321,85 @@ const ParticleSystem = () => {
         Math.pow(knuckles[i].y - palmBase.y, 2)
       );
       
-      // If fingertip is far from knuckle relative to palm, finger is extended
       if (tipToKnuckle > knuckleToPalm * 0.5) {
         extendedFingers++;
       }
     }
     
-    return extendedFingers >= 3; // Open hand if 3+ fingers extended
+    return extendedFingers >= 3;
   }, []);
 
-  // Initialize MediaPipe Hands
-  const startCamera = useCallback(async () => {
-    if (!videoRef.current) return;
+  // Process video frame with MediaPipe
+  const processFrame = useCallback(async () => {
+    if (!videoRef.current || !handsRef.current || !cameraActive || processingRef.current) return;
     
-    setIsLoading(true);
+    if (videoRef.current.readyState < 2) {
+      requestAnimationFrame(processFrame);
+      return;
+    }
+    
+    processingRef.current = true;
     
     try {
-      const hands = new Hands({
-        locateFile: (file) => {
-          return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+      await handsRef.current.send({ image: videoRef.current });
+    } catch (error) {
+      console.error('Frame processing error:', error);
+    }
+    
+    processingRef.current = false;
+    
+    if (cameraActive) {
+      requestAnimationFrame(processFrame);
+    }
+  }, [cameraActive]);
+
+  // Start camera with native getUserMedia
+  const startCamera = useCallback(async () => {
+    setIsLoading(true);
+    setErrorMsg(null);
+    
+    try {
+      // First, get camera access
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { 
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: 'user'
         }
+      });
+      
+      streamRef.current = stream;
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      // Dynamically import MediaPipe
+      const { Hands } = await import('@mediapipe/hands');
+      
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
       });
 
       hands.setOptions({
         maxNumHands: 1,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.7,
+        modelComplexity: 0, // Use lighter model for stability
+        minDetectionConfidence: 0.5,
         minTrackingConfidence: 0.5
       });
 
-      hands.onResults((results: Results) => {
+      hands.onResults((results: any) => {
         if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
           const landmarks = results.multiHandLandmarks[0];
           
-          // Get palm center (wrist + middle finger base)
           const palmX = (landmarks[0].x + landmarks[9].x) / 2;
           const palmY = (landmarks[0].y + landmarks[9].y) / 2;
           
-          // Convert to 3D world coordinates
-          // X: -1 to 1 mapped to -4 to 4
-          // Y: 0 to 1 mapped to 3 to -3 (inverted)
           const worldX = (palmX - 0.5) * 8;
           const worldY = (0.5 - palmY) * 6;
-          const worldZ = 0;
           
-          handPositionRef.current.set(worldX, worldY, worldZ);
+          handPositionRef.current.set(worldX, worldY, 0);
           handDetectedRef.current = true;
           
           const isOpen = calculateHandGesture(landmarks);
@@ -377,38 +411,44 @@ const ParticleSystem = () => {
         }
       });
 
-      mediapipeHandsRef.current = hands;
-
-      const camera = new Camera(videoRef.current, {
-        onFrame: async () => {
-          if (videoRef.current && mediapipeHandsRef.current) {
-            await mediapipeHandsRef.current.send({ image: videoRef.current });
-          }
-        },
-        width: 640,
-        height: 480
-      });
-
-      await camera.start();
-      mediapipeCameraRef.current = camera;
+      await hands.initialize();
+      handsRef.current = hands;
+      
       setCameraActive(true);
       setIsLoading(false);
-    } catch (error) {
+      
+      // Start processing loop
+      requestAnimationFrame(processFrame);
+      
+    } catch (error: any) {
       console.error('Error starting camera:', error);
+      setErrorMsg(error.message || 'Failed to start camera');
       setIsLoading(false);
+      setCameraActive(false);
     }
-  }, [calculateHandGesture]);
+  }, [calculateHandGesture, processFrame]);
+
+  // Effect to restart frame processing when camera becomes active
+  useEffect(() => {
+    if (cameraActive && handsRef.current) {
+      requestAnimationFrame(processFrame);
+    }
+  }, [cameraActive, processFrame]);
 
   const stopCamera = useCallback(() => {
-    if (mediapipeCameraRef.current) {
-      mediapipeCameraRef.current.stop();
-      mediapipeCameraRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
-    if (mediapipeHandsRef.current) {
-      mediapipeHandsRef.current.close();
-      mediapipeHandsRef.current = null;
+    if (handsRef.current) {
+      handsRef.current.close();
+      handsRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
     }
     handDetectedRef.current = false;
+    processingRef.current = false;
     setCameraActive(false);
     setHandStatus('none');
   }, []);
@@ -428,11 +468,14 @@ const ParticleSystem = () => {
       {/* Hidden video element for MediaPipe */}
       <video
         ref={videoRef}
-        className="hidden"
+        className="absolute opacity-0 pointer-events-none"
+        style={{ width: 1, height: 1 }}
         playsInline
-        autoPlay
         muted
       />
+      
+      {/* Hidden canvas for processing */}
+      <canvas ref={canvasRef} className="hidden" width={640} height={480} />
 
       {/* Title */}
       <div className="absolute top-6 left-1/2 -translate-x-1/2 text-center pointer-events-none">
@@ -477,8 +520,11 @@ const ParticleSystem = () => {
                 : 'bg-primary/20 border border-primary text-primary hover:bg-primary/30'
             } ${isLoading ? 'opacity-50 cursor-wait' : ''}`}
           >
-            {isLoading ? 'Initializing Camera...' : cameraActive ? '⏹ Stop Hand Tracking' : '▶ Start Hand Tracking'}
+            {isLoading ? 'Initializing...' : cameraActive ? '⏹ Stop Hand Tracking' : '▶ Start Hand Tracking'}
           </button>
+          {errorMsg && (
+            <p className="text-xs text-destructive mt-2 font-body">{errorMsg}</p>
+          )}
           <p className="text-xs text-muted-foreground mt-2 font-body">
             {cameraActive 
               ? 'Open hand = push • Fist = pull' 
@@ -563,14 +609,18 @@ const ParticleSystem = () => {
       </div>
 
       {/* Camera Preview (when active) */}
-      {cameraActive && (
+      {cameraActive && videoRef.current?.srcObject && (
         <div className="absolute top-20 right-6 w-40 h-30 glass-panel overflow-hidden rounded-lg border border-primary/30">
           <video
-            ref={videoRef}
             className="w-full h-full object-cover scale-x-[-1]"
             playsInline
             autoPlay
             muted
+            ref={(el) => {
+              if (el && streamRef.current) {
+                el.srcObject = streamRef.current;
+              }
+            }}
           />
           <div className="absolute inset-0 border-2 border-primary/20 rounded-lg pointer-events-none" />
         </div>
